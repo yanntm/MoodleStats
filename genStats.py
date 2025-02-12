@@ -13,7 +13,44 @@ def detect_delimiter(file_path):
         first_line = file.readline()
         return ';' if first_line.count(';') > first_line.count(',') else ','
 
+
+def detect_id_column(df):
+    """
+    Detects a column likely to be a student ID by checking:
+      - The column values are convertible to numeric (after stripping quotes),
+      - All entries are unique,
+      - The median value is well above typical grade ranges (> 1000).
+    Prints debug information for each column.
+    Returns the column name if found, else None.
+    """
+    for col in df.columns:
+        series = df[col]
+        print(f"Testing column: {col}")
+        # If values are strings, strip common quote characters.
+        if series.dtype == object:
+            series_clean = series.str.strip('"').str.strip("'")
+        else:
+            series_clean = series
+        try:
+            numeric_vals = pd.to_numeric(series_clean, errors='raise')
+            print(f"  Sample converted values: {numeric_vals.head().tolist()}")
+            if df[col].nunique() == len(df):
+                median_val = numeric_vals.median()
+                print(f"  Median: {median_val}")
+                if median_val > 1000:
+                    print(f"  -> Selected as ID column")
+                    return col
+        except Exception as e:
+            print(f"  Conversion failed: {e}")
+            continue
+    return None
+
+
+
 def preprocess_data(df):
+    # Remove rows that contain the string "root@localhost" in any cell.
+    df = df[~df.apply(lambda row: row.astype(str).str.contains("root@localhost", case=False, na=False).any(), axis=1)]
+
     """Preprocesses the data: converts numeric columns, replaces missing values, and filters out IDs."""
     for col in df.columns:
         df[col] = df[col].astype(str).str.lstrip("'")  # Remove leading quotes from Moodle export
@@ -25,6 +62,17 @@ def preprocess_data(df):
     df = df.dropna(axis=1, how='all')
     
     return df
+
+def detect_group_column(df):
+    """
+    Detects the column representing group information by matching its name against a regex.
+    Returns the column name if found, otherwise None.
+    """
+    for col in df.columns:
+        if re.search(r'.*group.*', col, re.IGNORECASE):
+            return col
+    return None
+
 
 def is_grade_column(series):
     """Determines if a column is a valid grade column by checking its value range and uniqueness."""
@@ -136,10 +184,179 @@ def plot_distribution(series, column_name, pdf):
     add_statistics_table(pdf, stats_inscrits, stats_presents, f"Statistiques sur {column_name}", series)
     os.remove(plot_filename)
 
+
+def compute_stats(series, fillna=False):
+    """Compute descriptive statistics.
+    If fillna is True, replace NaN with 0 (for inscrits); otherwise, only use present values.
+    """
+    s = series.fillna(0) if fillna else series.dropna()
+    stats = s.describe().to_dict()
+    max_score = 100 if stats['max'] > 20 else 20
+    threshold = 50 if max_score == 100 else 10
+    count_above = sum(1 for val in s if isinstance(val, (int, float)) and val >= threshold)
+    percentage_above = (count_above / stats["count"]) * 100 if stats["count"] > 0 else 0
+    # Determine min and max occurrences
+    if fillna:
+        min_value = 0 if series.isna().sum() > 0 else stats['min']
+        min_count = (series.fillna(0) == min_value).sum()
+    else:
+        min_value = stats['min']
+        min_count = (s == min_value).sum()
+    max_count = (s == stats['max']).sum()
+    
+    stats["threshold"] = threshold
+    stats["count_above"] = count_above
+    stats["percentage_above"] = percentage_above
+    stats["min_count"] = min_count
+    stats["max_count"] = max_count
+    return stats
+
+
+def plot_small_distribution(ax, series, max_score, threshold, title):
+    """Plot a small histogram on a given axis."""
+    s = series.dropna()
+    sns.histplot(s, bins=20, kde=True, color="lightblue",
+                 edgecolor="black", alpha=0.6, ax=ax)
+    stats = s.describe()
+    ax.axvline(stats["25%"], color="blue", linestyle="--")
+    ax.axvline(stats["50%"], color="red", linestyle="-")
+    ax.axvline(stats["75%"], color="blue", linestyle="--")
+    ax.axvline(stats["mean"], color="green", linestyle=":")
+    ax.set_title(title, fontsize=10)
+    ax.set_xlim(0, max_score + 1)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+def plot_group_details(series, column_name, df_groups, pdf):
+    """Add detail pages with per-group plots and a combined statistics table.
+    
+    The top-left plot shows overall (presents) data.
+    The other plots (up to 5 per page) show data for each group.
+    """
+    # Merge group info with the grade series.
+    # (Assume 'Numéro d’identification' is the join key and that df_groups contains it.)
+    # Ensure the join keys are of the same type
+    # Reset index so that the ID becomes a column
+    grades_df = series.reset_index()  # this creates a column 'ID' because main CSV index was set to 'ID'
+    merged = df_groups[['ID', 'group']].merge(
+      grades_df,
+      on='ID',
+      how='inner'
+    )
+
+    overall = series.dropna()
+    overall_stats = compute_stats(series, fillna=False)
+    max_score = 100 if overall_stats['max'] > 20 else 20
+    threshold = overall_stats['threshold']
+    
+    # Determine groups with at least one present grade.
+    group_names = merged.dropna(subset=[column_name])['group'].unique()
+    group_names = sorted(group_names)
+    
+    print(f"Found {len(group_names)} groups: {', '.join(group_names)}")
+    
+    group_counts = merged.dropna(subset=[column_name]).groupby('group').size().to_dict()
+    print("Group sizes: " + ", ".join(f"{grp}: {count}" for grp, count in group_counts.items()))
+
+    
+    # Process groups in chunks of 5 (overall plot + 5 groups per page)
+    chunk_size = 3
+    for i in range(0, len(group_names), chunk_size):
+        chunk = group_names[i:i+chunk_size]
+        total_plots = 1 + len(chunk)  # one overall plot + one per group
+        
+        # Layout: aim for 3 columns per row.
+        ncols = 2
+        nrows = (total_plots + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3, nrows*3))
+        axes = axes.flatten()
+        
+        # Plot overall data in the first subplot.
+        plot_small_distribution(axes[0], overall, max_score, threshold, "Tous les inscrits")
+        
+        # Dictionary to hold stats for table (key: group label)
+        stats_dict = {"Tous les inscrits": overall_stats}
+        # For each group, plot the group's present grades.
+        for idx, grp in enumerate(chunk, start=1):
+            grp_series = merged[merged['group'] == grp][column_name].dropna()
+            if grp_series.empty:
+                axes[idx].axis('off')
+                continue
+            plot_small_distribution(axes[idx], grp_series, max_score, threshold, grp)
+            stats_dict[grp] = compute_stats(grp_series, fillna=False)
+        
+        # Hide any unused axes.
+        for j in range(total_plots, len(axes)):
+            axes[j].axis('off')
+        
+        # Save the grid plot and add it to PDF.
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', column_name)
+        temp_fig_file = f"temp_{safe_name}_{i}.png"
+        plt.tight_layout()
+        plt.savefig(temp_fig_file, bbox_inches='tight')
+        plt.close(fig)
+        pdf.add_page()
+        pdf.image(temp_fig_file, x=10, y=30, w=180)
+        os.remove(temp_fig_file)
+        
+        # Add the combined statistics table.
+        add_detailed_statistics_table(pdf, stats_dict, column_name)
+
+def add_detailed_statistics_table(pdf, stats_dict, column_name):
+    """Add a table comparing overall and per-group statistics."""
+    pdf.set_y(220)  # Adjust vertical position as needed.
+    pdf.set_font("Arial", size=12, style='B')
+    header = ["Statistique"] + list(stats_dict.keys())
+    col_width = 40
+    row_height = 6
+    
+    # Header row.
+    for item in header:
+        pdf.cell(col_width, row_height, txt=item, border=1, align='C')
+    pdf.ln(row_height)
+    
+    # Define the rows: each tuple is (stat key, label)
+    stat_keys = [
+        ("count", "Nombre de notes"),
+        ("mean", "Moyenne"),
+        ("std", "Écart type"),
+        ("min", "Min"),
+        ("25%", "Q1 (25%)"),
+        ("50%", "Médiane (50%)"),
+        ("75%", "Q3 (75%)"),
+        ("max", "Max"),
+        ("count_above", f"Nombre >= {stats_dict['Tous les inscrits']['threshold']}")
+    ]
+    
+    # Data rows.
+    for key, label in stat_keys:
+        pdf.set_font("Arial", size=10)
+        pdf.cell(col_width, row_height, txt=label, border=1, align='C')
+        for stat in stats_dict.values():
+            if key == "count":
+                value = f"{int(stat[key])}"  # print integer without decimals
+            elif key == "count_above":
+                value = f"{int(stat['count_above'])} ({int(round(stat['percentage_above']))}%)"
+            else:
+                value = f"{stat[key]:.2f}"
+            pdf.cell(col_width, row_height, txt=value, border=1, align='C')
+        pdf.ln(row_height)
+
+
 def generate_pdf(file_path):
     delimiter = detect_delimiter(file_path)
     df = pd.read_csv(file_path, delimiter=delimiter)
     df = preprocess_data(df)
+    
+    id_col_main = detect_id_column(df)
+    if id_col_main:
+        df.rename(columns={id_col_main: "ID"}, inplace=True)
+        df["ID"] = df["ID"].astype(str)
+        df.set_index("ID", inplace=True)
+        print(f"Main CSV: detected ID column '{id_col_main}', renamed to 'ID'.")
+    else:
+        print("Main CSV: no ID column detected.")
+
+    
     
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -154,8 +371,66 @@ def generate_pdf(file_path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python genstats.py <input_csv_file>")
+    if len(sys.argv) < 2:
+        print("Usage: python genstats.py <input_csv_file> [group_csv_file]")
         sys.exit(1)
     input_file = sys.argv[1]
-    generate_pdf(input_file)
+    group_file = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    delimiter = detect_delimiter(input_file)
+    df = pd.read_csv(input_file, delimiter=delimiter)
+    df = preprocess_data(df)
+    
+    id_col_main = detect_id_column(df)
+    if id_col_main:
+        df.rename(columns={id_col_main: "ID"}, inplace=True)
+        df["ID"] = df["ID"].astype(str)
+        df.set_index("ID", inplace=True)
+        print(f"Main CSV: detected ID column '{id_col_main}', renamed to 'ID'.")
+    else:
+        print("Main CSV: no ID column detected.")
+
+    if group_file is not None:
+      df_groups = pd.read_csv(group_file, delimiter=detect_delimiter(group_file))
+      
+      # Detect and rename the group column using regex.
+      group_col = detect_group_column(df_groups)
+      if group_col:
+          df_groups.rename(columns={group_col: "group"}, inplace=True)
+          print(f"Group CSV: detected group column '{group_col}', renamed to 'group'.")
+      else:
+          print("Group CSV: no group column detected.")
+      
+      # Filter out rows with empty or missing group values.
+      if "group" in df_groups.columns:
+          before_filter = len(df_groups)
+          df_groups = df_groups[df_groups["group"].notna() & (df_groups["group"].astype(str).str.strip() != "")]
+          print(f"Group CSV: filtered out empty group rows, from {before_filter} to {len(df_groups)} records.")
+
+      # Detect and rename the ID column in group CSV.
+      id_col_group = detect_id_column(df_groups)
+      if id_col_group:
+          df_groups.rename(columns={id_col_group: "ID"}, inplace=True)
+          df_groups["ID"] = df_groups["ID"].astype(str)
+          print(f"Group CSV: detected ID column '{id_col_group}', renamed to 'ID'.")
+      else:
+          print("Group CSV: no ID column detected.")
+      
+    else:
+        df_groups = None
+
+    
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    for column in df.columns:
+        if df[column].dtype in [np.float64, np.int64] and is_grade_column(df[column]):
+            # Summary page.
+            plot_distribution(df[column], column, pdf)
+            # Detail page with group stats, if available.
+            if df_groups is not None:
+                plot_group_details(df[column], column, df_groups, pdf)
+    
+    output_pdf = input_file.rsplit('.', 1)[0] + ".pdf"
+    pdf.output(output_pdf)
+    print(f"Generated {output_pdf}")
