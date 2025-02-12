@@ -13,46 +13,54 @@ def detect_delimiter(file_path):
         first_line = file.readline()
         return ';' if first_line.count(';') > first_line.count(',') else ','
 
-
 def detect_id_column(df):
     """
-    Detects a column likely to be a student ID by checking:
-      - The column values are convertible to numeric (after stripping quotes),
-      - All entries are unique,
-      - The median value is well above typical grade ranges (> 1000).
-    Prints debug information for each column.
+    Detects a column likely to be a student ID by looking for a column name
+    that matches the regex /.*ident.*/i.
     Returns the column name if found, else None.
     """
     for col in df.columns:
-        series = df[col]
-        print(f"Testing column: {col}")
-        # If values are strings, strip common quote characters.
-        if series.dtype == object:
-            series_clean = series.str.strip('"').str.strip("'")
-        else:
-            series_clean = series
-        try:
-            numeric_vals = pd.to_numeric(series_clean, errors='raise')
-            print(f"  Sample converted values: {numeric_vals.head().tolist()}")
-            if df[col].nunique() == len(df):
-                median_val = numeric_vals.median()
-                print(f"  Median: {median_val}")
-                if median_val > 1000:
-                    print(f"  -> Selected as ID column")
-                    return col
-        except Exception as e:
-            print(f"  Conversion failed: {e}")
-            continue
+        if re.search(r'.*ident.*', col, re.IGNORECASE):
+            print(f"Selected column '{col}' as ID column based on regex match.")
+            return col
     return None
 
-
+def process_id_column(df):
+    """
+    Detects the ID column using detect_id_column, renames it to "ID",
+    filters out rows where the ID is NA, empty, or equals "nan" (case-insensitive),
+    normalizes the IDs (removes trailing .0 for whole numbers), prints a debug trace,
+    and returns the modified DataFrame.
+    """
+    df = df.copy()
+    id_col = detect_id_column(df)
+    if id_col:
+        print(f"Detected ID column '{id_col}', renaming to 'ID' and cleaning data.")
+        before = len(df)
+        df.rename(columns={id_col: "ID"}, inplace=True)
+        # Filter out rows where ID is NA or blank or equals "nan"
+        df = df[df["ID"].notna()]
+        df = df[df["ID"].astype(str).str.strip().str.lower() != "nan"]
+        df = df[df["ID"].astype(str).str.strip() != ""]
+        after = len(df)
+        print(f"Removed {before - after} rows with empty/invalid ID (from {before} to {after}).")
+        # Normalize: if the ID is numeric with a trailing .0, convert to int then string.
+        df["ID"] = df["ID"].apply(
+            lambda x: str(int(float(x))) if re.match(r"^-?\d+\.0$", str(x).strip()) else str(x).strip()
+        )
+    else:
+        print("No ID column detected.")
+    return df
 
 def preprocess_data(df):
+    df = df.copy()
     # Remove rows that contain the string "root@localhost" in any cell.
     df = df[~df.apply(lambda row: row.astype(str).str.contains("root@localhost", case=False, na=False).any(), axis=1)]
 
     """Preprocesses the data: converts numeric columns, replaces missing values, and filters out IDs."""
     for col in df.columns:
+        if col == "ID":
+          continue  # Skip the ID column.
         df[col] = df[col].astype(str).str.lstrip("'")  # Remove leading quotes from Moodle export
         df[col] = df[col].replace("-", np.nan)  # Mark "-" as NaN (absent students)
         df[col] = df[col].str.replace('%', '', regex=True).str.strip()  # Remove percentage signs if present
@@ -237,11 +245,18 @@ def plot_group_details(series, column_name, df_groups, pdf):
     # Ensure the join keys are of the same type
     # Reset index so that the ID becomes a column
     grades_df = series.reset_index()  # this creates a column 'ID' because main CSV index was set to 'ID'
+    
+    # Debug: show a few IDs from both DataFrames.
+    # print("Main CSV IDs (sample):", grades_df["ID"].head(10).tolist())
+    # print("Group CSV IDs (sample):", df_groups["ID"].head(10).tolist())
+    
     merged = df_groups[['ID', 'group']].merge(
       grades_df,
       on='ID',
       how='inner'
     )
+
+    # print("Merged DataFrame shape:", merged.shape)
 
     overall = series.dropna()
     overall_stats = compute_stats(series, fillna=False)
@@ -306,7 +321,7 @@ def add_detailed_statistics_table(pdf, stats_dict, column_name):
     pdf.set_y(220)  # Adjust vertical position as needed.
     pdf.set_font("Arial", size=12, style='B')
     header = ["Statistique"] + list(stats_dict.keys())
-    col_width = 40
+    col_width = 35
     row_height = 6
     
     # Header row.
@@ -342,33 +357,6 @@ def add_detailed_statistics_table(pdf, stats_dict, column_name):
         pdf.ln(row_height)
 
 
-def generate_pdf(file_path):
-    delimiter = detect_delimiter(file_path)
-    df = pd.read_csv(file_path, delimiter=delimiter)
-    df = preprocess_data(df)
-    
-    id_col_main = detect_id_column(df)
-    if id_col_main:
-        df.rename(columns={id_col_main: "ID"}, inplace=True)
-        df["ID"] = df["ID"].astype(str)
-        df.set_index("ID", inplace=True)
-        print(f"Main CSV: detected ID column '{id_col_main}', renamed to 'ID'.")
-    else:
-        print("Main CSV: no ID column detected.")
-
-    
-    
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    
-    for column in df.columns:
-        if df[column].dtype in [np.float64, np.int64] and is_grade_column(df[column]):
-            plot_distribution(df[column], column, pdf)
-    
-    output_pdf = file_path.rsplit('.', 1)[0] + ".pdf"
-    pdf.output(output_pdf)
-    print(f"Generated {output_pdf}")
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -379,19 +367,18 @@ if __name__ == "__main__":
     
     delimiter = detect_delimiter(input_file)
     df = pd.read_csv(input_file, delimiter=delimiter)
+    df = process_id_column(df)
     df = preprocess_data(df)
     
-    id_col_main = detect_id_column(df)
-    if id_col_main:
-        df.rename(columns={id_col_main: "ID"}, inplace=True)
-        df["ID"] = df["ID"].astype(str)
-        df.set_index("ID", inplace=True)
-        print(f"Main CSV: detected ID column '{id_col_main}', renamed to 'ID'.")
-    else:
-        print("Main CSV: no ID column detected.")
+    if "ID" in df.columns:
+      df.set_index("ID", inplace=True)
+      print("Main CSV: processed ID column and set index to 'ID'.")
 
     if group_file is not None:
       df_groups = pd.read_csv(group_file, delimiter=detect_delimiter(group_file))
+      
+      # Process the group CSV ID column
+      df_groups = process_id_column(df_groups)
       
       # Detect and rename the group column using regex.
       group_col = detect_group_column(df_groups)
@@ -406,15 +393,6 @@ if __name__ == "__main__":
           before_filter = len(df_groups)
           df_groups = df_groups[df_groups["group"].notna() & (df_groups["group"].astype(str).str.strip() != "")]
           print(f"Group CSV: filtered out empty group rows, from {before_filter} to {len(df_groups)} records.")
-
-      # Detect and rename the ID column in group CSV.
-      id_col_group = detect_id_column(df_groups)
-      if id_col_group:
-          df_groups.rename(columns={id_col_group: "ID"}, inplace=True)
-          df_groups["ID"] = df_groups["ID"].astype(str)
-          print(f"Group CSV: detected ID column '{id_col_group}', renamed to 'ID'.")
-      else:
-          print("Group CSV: no ID column detected.")
       
     else:
         df_groups = None
