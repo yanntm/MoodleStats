@@ -18,6 +18,7 @@ def preprocess_data(df):
     for col in df.columns:
         df[col] = df[col].astype(str).str.lstrip("'")  # Remove leading quotes from Moodle export
         df[col] = df[col].replace("-", np.nan)  # Mark "-" as NaN (absent students)
+        df[col] = df[col].str.replace('%', '', regex=True).str.strip()  # Remove percentage signs if present
         df[col] = pd.to_numeric(df[col], errors='coerce')  # Convert to numeric where possible
 
     # Drop columns that are completely empty after removing non-numeric values
