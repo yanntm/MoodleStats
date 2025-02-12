@@ -89,8 +89,7 @@ def add_statistics_table(pdf, stats_inscrits, stats_presents, title, series):
         ["Médiane (50%)", f"{stats_inscrits['50%']:.2f}", f"{stats_presents['50%']:.2f}"],
         ["Q3 (75%)", f"{stats_inscrits['75%']:.2f}", f"{stats_presents['75%']:.2f}"],
         ["Max", max_display, max_display],  # Show max + count
-        [f"Nombre >= {threshold}", f"{int(count_above_threshold_inscrits)}", f"{int(count_above_threshold_presents)}"],
-        [f"% au-dessus de {threshold}", f"{percentage_above_inscrits:.2f}%", f"{percentage_above_presents:.2f}%"],
+        [f"Nombre >= {threshold}", f"{int(count_above_threshold_inscrits)} ({percentage_above_inscrits:.0f}%)", f"{int(count_above_threshold_presents)} ({percentage_above_presents:.0f}%)"],
     ]
 
     col_width = 60
