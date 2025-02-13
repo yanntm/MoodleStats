@@ -25,6 +25,22 @@ def detect_id_column(df):
             return col
     return None
 
+def alphanum_key(s):
+    """
+    Splits the string into (prefix, number, remainder) where:
+      - prefix is the non-digit part before the first number (in lower case)
+      - number is the first number as an integer (if present)
+      - remainder is the rest of the string (in lower case)
+    If no number is found, returns a one-element tuple.
+    """
+    match = re.match(r'([^0-9]*)([0-9]+)(.*)', s)
+    if match:
+        prefix, num, remainder = match.groups()
+        return (prefix.lower(), int(num), remainder.lower())
+    else:
+        return (s.lower(),)
+
+
 def process_id_column(df):
     """
     Detects the ID column using detect_id_column, renames it to "ID",
@@ -234,76 +250,52 @@ def plot_small_distribution(ax, series, max_score, threshold, title):
     ax.set_xlim(0, max_score + 1)
     ax.grid(True, linestyle="--", alpha=0.6)
 
-def plot_group_details(series, column_name, df_groups, pdf):
-    """Add detail pages with per-group plots and a combined statistics table.
-    
-    The top-left plot shows overall (presents) data.
-    The other plots (up to 5 per page) show data for each group.
+def plot_group_details(merged_df, column_name, pdf):
     """
-    # Merge group info with the grade series.
-    # (Assume 'Numéro d’identification' is the join key and that df_groups contains it.)
-    # Ensure the join keys are of the same type
-    # Reset index so that the ID becomes a column
-    grades_df = series.reset_index()  # this creates a column 'ID' because main CSV index was set to 'ID'
-    
-    # Debug: show a few IDs from both DataFrames.
-    # print("Main CSV IDs (sample):", grades_df["ID"].head(10).tolist())
-    # print("Group CSV IDs (sample):", df_groups["ID"].head(10).tolist())
-    
-    merged = df_groups[['ID', 'group']].merge(
-      grades_df,
-      on='ID',
-      how='inner'
-    )
-
-    # print("Merged DataFrame shape:", merged.shape)
-
-    overall = series.dropna()
-    overall_stats = compute_stats(series, fillna=False)
+    Plots overall and per-group statistics for the given grade column.
+    Assumes merged_df contains a 'group' column.
+    """
+    # Filter rows with valid group and grade values.
+    df_valid = merged_df[merged_df[column_name].notna() & merged_df["group"].notna()]
+    overall = df_valid[column_name].dropna()
+    overall_stats = compute_stats(overall, fillna=False)
     max_score = 100 if overall_stats['max'] > 20 else 20
     threshold = overall_stats['threshold']
     
-    # Determine groups with at least one present grade.
-    group_names = merged.dropna(subset=[column_name])['group'].unique()
-    group_names = sorted(group_names)
-    
+    # Get group names sorted with a natural/alphanum key.
+    group_names = df_valid["group"].unique()
+    group_names = sorted(group_names, key=alphanum_key)
     print(f"Found {len(group_names)} groups: {', '.join(group_names)}")
-    
-    group_counts = merged.dropna(subset=[column_name]).groupby('group').size().to_dict()
+    group_counts = df_valid.groupby("group").size().to_dict()
     print("Group sizes: " + ", ".join(f"{grp}: {count}" for grp, count in group_counts.items()))
-
     
-    # Process groups in chunks of 5 (overall plot + 5 groups per page)
-    chunk_size = 3
+    # Process groups in chunks.
+    chunk_size = 3  # Adjust as needed.
     for i in range(0, len(group_names), chunk_size):
         chunk = group_names[i:i+chunk_size]
-        total_plots = 1 + len(chunk)  # one overall plot + one per group
-        
-        # Layout: aim for 3 columns per row.
+        total_plots = 1 + len(chunk)  # One overall plot + one per group.
         ncols = 2
         nrows = (total_plots + ncols - 1) // ncols
-        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*3, nrows*3))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3, nrows * 3))
         axes = axes.flatten()
         
-        # Plot overall data in the first subplot.
-        plot_small_distribution(axes[0], overall, max_score, threshold, "Tous les inscrits")
+        # Plot overall distribution.
+        plot_small_distribution(axes[0], overall, max_score, threshold, "Tous les présents")
+        stats_dict = {"Tous les présents": overall_stats}
         
-        # Dictionary to hold stats for table (key: group label)
-        stats_dict = {"Tous les inscrits": overall_stats}
-        # For each group, plot the group's present grades.
+        # Plot each group's distribution.
         for idx, grp in enumerate(chunk, start=1):
-            grp_series = merged[merged['group'] == grp][column_name].dropna()
+            grp_series = df_valid[df_valid["group"] == grp][column_name].dropna()
             if grp_series.empty:
                 axes[idx].axis('off')
                 continue
             plot_small_distribution(axes[idx], grp_series, max_score, threshold, grp)
             stats_dict[grp] = compute_stats(grp_series, fillna=False)
         
-        # Hide any unused axes.
+        # Hide unused axes.
         for j in range(total_plots, len(axes)):
             axes[j].axis('off')
         
-        # Save the grid plot and add it to PDF.
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', column_name)
         temp_fig_file = f"temp_{safe_name}_{i}.png"
         plt.tight_layout()
@@ -313,7 +305,6 @@ def plot_group_details(series, column_name, df_groups, pdf):
         pdf.image(temp_fig_file, x=10, y=30, w=180)
         os.remove(temp_fig_file)
         
-        # Add the combined statistics table.
         add_detailed_statistics_table(pdf, stats_dict, column_name)
 
 def add_detailed_statistics_table(pdf, stats_dict, column_name):
@@ -397,17 +388,26 @@ if __name__ == "__main__":
     else:
         df_groups = None
 
+    if df_groups is not None:
+      # Reset index (since main CSV has 'ID' as index) to merge on column 'ID'
+      df.reset_index(inplace=True)
+      # Merge group information; use a left join so all main CSV rows are kept.
+      df = df.merge(df_groups[['ID', 'group']], on="ID", how="left")
+      print(f"Merged main CSV and group CSV: {df.shape[0]} records.")
+
     
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     
     for column in df.columns:
+        if column in ["ID", "group"]:
+            continue  # Skip non-grade columns.
         if df[column].dtype in [np.float64, np.int64] and is_grade_column(df[column]):
-            # Summary page.
+            # Generate the overall distribution plot.
             plot_distribution(df[column], column, pdf)
-            # Detail page with group stats, if available.
-            if df_groups is not None:
-                plot_group_details(df[column], column, df_groups, pdf)
+            # If group info is available, plot group details using the merged DataFrame.
+            if "group" in df.columns:
+                plot_group_details(df, column, pdf)
     
     output_pdf = input_file.rsplit('.', 1)[0] + ".pdf"
     pdf.output(output_pdf)
